@@ -2,27 +2,50 @@ require("dotenv").config()
 const express = require("express")
 const mongoose = require("mongoose")
 const path = require("path")
+const cookieParser = require("cookie-parser")
+
+// Import your existing models and services
 const Doctor = require("./doctorModel")
 const Patient = require("./patientModel")
 const Transaction = require("./transactionModel")
 const paymentService = require("./paymentService")
 const ValidationUtils = require("./validationUtils")
 
+// Import authentication middleware
+const { requireAuth } = require("./middleware/auth")
+const authRoutes = require("./routes/auth")
+
 const app = express()
+
+// Middleware
 app.use(express.json())
 app.use(express.urlencoded({ extended: true }))
+app.use(cookieParser())
 app.use("/public", express.static(path.join(__dirname, "public")))
 
-// Fixed hospital name
-const HOSPITAL_NAME = "ABC Hospital"
+// Fixed hospital name and ID
+const HOSPITAL_NAME = process.env.HOSPITAL_NAME || "ABC Hospital"
+const HOSPITAL_ID = process.env.HOSPITAL_ID || "hospital_abc"
 
-// Admin page
-app.get("/admin", (req, res) => {
-  res.sendFile(path.join(__dirname, "public/admin.html"))
+// Auth routes (no auth required)
+app.use("/api/auth", authRoutes)
+
+// Protected admin route
+app.get("/admin", requireAuth, (req, res) => {
+  res.sendFile(path.join(__dirname, "public", "admin.html"))
 })
 
-// Add doctor (updated to include fee)
-app.post("/api/doctors", async (req, res) => {
+// Root redirect
+app.get("/", (req, res) => {
+  res.redirect("/admin")
+})
+
+// ========================================
+// PROTECTED API ROUTES (require authentication)
+// ========================================
+
+// Add doctor (protected)
+app.post("/api/doctors", requireAuth, async (req, res) => {
   try {
     const { name, specialization, schedule, fee = 500, currency = "INR" } = req.body
     const newDoc = await Doctor.create({
@@ -32,6 +55,7 @@ app.post("/api/doctors", async (req, res) => {
       queue: [],
       fee: Number(fee),
       currency,
+      hospitalId: req.auth.hospitalId, // Add hospital ID
     })
     res.json(newDoc)
   } catch (error) {
@@ -39,25 +63,236 @@ app.post("/api/doctors", async (req, res) => {
   }
 })
 
-// Get active doctors (for central app)
-app.get("/api/doctors", async (req, res) => {
-  const docs = await Doctor.find({ active: true }, "-queue")
-  res.json({ hospital: HOSPITAL_NAME, doctors: docs })
-})
-
-// Admin only: fetch all doctors
-app.get("/api/admin/doctors", async (req, res) => {
-  const doctors = await Doctor.find()
+// Admin only: fetch all doctors (protected)
+app.get("/api/admin/doctors", requireAuth, async (req, res) => {
+  const doctors = await Doctor.find({ hospitalId: req.auth.hospitalId })
   res.json({ doctors })
 })
 
-// Get queue
+// Toggle active/inactive (protected)
+app.post("/api/admin/doctors/:id/toggle", requireAuth, async (req, res) => {
+  const doc = await Doctor.findOne({ _id: req.params.id, hospitalId: req.auth.hospitalId })
+  if (!doc) return res.status(404).json({ error: "Doctor not found" })
+
+  doc.active = !doc.active
+  await doc.save()
+  res.json({ active: doc.active })
+})
+
+// Update doctor fee (protected)
+app.post("/api/admin/doctors/:id/fee", requireAuth, async (req, res) => {
+  try {
+    const { fee, currency = "INR" } = req.body
+
+    if (!fee || fee < 0) {
+      return res.status(400).json({ error: "Invalid fee amount" })
+    }
+
+    const doc = await Doctor.findOneAndUpdate(
+      { _id: req.params.id, hospitalId: req.auth.hospitalId },
+      { fee: Number(fee), currency },
+      { new: true },
+    )
+
+    if (!doc) return res.status(404).json({ error: "Doctor not found" })
+
+    res.json({ success: true, doctor: doc })
+  } catch (error) {
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// PUT version for fee update (protected)
+app.put("/api/admin/doctors/:id/fee", requireAuth, async (req, res) => {
+  try {
+    const { fee, currency = "INR" } = req.body
+
+    if (!fee || fee < 0) {
+      return res.status(400).json({ error: "Invalid fee amount" })
+    }
+
+    const doc = await Doctor.findOneAndUpdate(
+      { _id: req.params.id, hospitalId: req.auth.hospitalId },
+      { fee: Number(fee), currency },
+      { new: true },
+    )
+
+    if (!doc) return res.status(404).json({ error: "Doctor not found" })
+
+    res.json({ success: true, doctor: doc })
+  } catch (error) {
+    res.status(500).json({ error: error.message })
+  }
+})
+
+// Get all transactions (admin) (protected)
+app.get("/api/admin/transactions", requireAuth, async (req, res) => {
+  try {
+    const { page = 1, limit = 20, status } = req.query
+
+    const query = { hospitalId: req.auth.hospitalId }
+    if (status) {
+      query.paymentStatus = status
+    }
+
+    const transactions = await Transaction.find(query)
+      .populate("doctorId", "name specialization")
+      .populate("patientId", "name age gender")
+      .sort({ createdAt: -1 })
+      .limit(limit * 1)
+      .skip((page - 1) * limit)
+      .exec()
+
+    const total = await Transaction.countDocuments(query)
+
+    res.json({
+      success: true,
+      data: {
+        transactions,
+        pagination: {
+          current: page,
+          pages: Math.ceil(total / limit),
+          total,
+        },
+      },
+    })
+  } catch (error) {
+    console.error("Error fetching all transactions:", error)
+    res.status(500).json({
+      success: false,
+      message: "Error fetching transaction history",
+    })
+  }
+})
+
+// Get patients (protected)
+app.get("/api/admin/patients/:doctorId", requireAuth, async (req, res) => {
+  const patients = await Patient.find({
+    doctorId: req.params.doctorId,
+    hospitalId: req.auth.hospitalId,
+  })
+  res.json({ patients })
+})
+
+app.get("/api/admin/patients", requireAuth, async (req, res) => {
+  const patients = await Patient.find({ hospitalId: req.auth.hospitalId }).populate("doctorId")
+  res.json({ patients })
+})
+
+// Refund payment (protected)
+app.post("/api/transactions/:transactionId/refund", requireAuth, async (req, res) => {
+  try {
+    const { transactionId } = req.params
+    const { reason = "Appointment cancelled by hospital" } = req.body
+
+    // Find transaction for this hospital
+    const transaction = await Transaction.findOne({
+      transactionId,
+      hospitalId: req.auth.hospitalId,
+    })
+
+    if (!transaction) {
+      return res.status(404).json({
+        success: false,
+        message: "Transaction not found",
+      })
+    }
+
+    if (transaction.paymentStatus !== "completed") {
+      return res.status(400).json({
+        success: false,
+        message: "Cannot refund incomplete payment",
+      })
+    }
+
+    // Process refund
+    const refundResult = await paymentService.refundRazorpayPayment(
+      transaction.transactionId,
+      transaction.amount,
+      reason,
+    )
+
+    if (refundResult.success) {
+      // Update transaction status
+      transaction.paymentStatus = "refunded"
+      transaction.paymentGatewayResponse = {
+        ...transaction.paymentGatewayResponse,
+        refund: refundResult.refundData,
+        refundedAt: new Date().toISOString(),
+      }
+      await transaction.save()
+
+      return res.json({
+        success: true,
+        message: "Refund processed successfully",
+        data: {
+          refundId: refundResult.refundId,
+          amount: refundResult.amount,
+          status: refundResult.status,
+        },
+      })
+    }
+  } catch (error) {
+    console.error("❌ Refund error:", error)
+    return res.status(500).json({
+      success: false,
+      message: "Refund processing failed",
+      error: error.message,
+    })
+  }
+})
+
+// Dashboard stats API
+app.get("/api/dashboard/stats", requireAuth, async (req, res) => {
+  try {
+    // Get stats for the authenticated hospital
+    const hospitalId = req.auth.hospitalId
+
+    // Your existing database queries here, filtered by hospitalId
+    const stats = {
+      doctors: 12, // Replace with actual query
+      patients: 45, // Replace with actual query
+      queue: 8, // Replace with actual query
+      revenue: 25430, // Replace with actual query
+    }
+
+    res.json({
+      success: true,
+      stats: stats,
+    })
+  } catch (error) {
+    console.error("Dashboard stats error:", error)
+    res.status(500).json({
+      success: false,
+      message: "Failed to load dashboard stats",
+    })
+  }
+})
+
+// ========================================
+// PUBLIC API ROUTES (for patient app)
+// ========================================
+
+// Get active doctors (for central app) - PUBLIC
+app.get("/api/doctors", async (req, res) => {
+  const docs = await Doctor.find(
+    {
+      active: true,
+      hospitalId: HOSPITAL_ID,
+    },
+    "-queue",
+  )
+  res.json({ hospital: HOSPITAL_NAME, doctors: docs })
+})
+
+// Get queue - PUBLIC
 app.get("/api/doctors/:id/queue", async (req, res) => {
-  const doc = await Doctor.findById(req.params.id)
+  const doc = await Doctor.findOne({ _id: req.params.id, hospitalId: HOSPITAL_ID })
+  if (!doc) return res.status(404).json({ error: "Doctor not found" })
   res.json({ queue: doc.queue })
 })
 
-// 🆕 STEP 1: Create Razorpay order (initiate payment)
+// Create Razorpay order - PUBLIC
 app.post("/api/doctors/:id/create-order", async (req, res) => {
   try {
     const doctorId = req.params.id
@@ -74,7 +309,7 @@ app.post("/api/doctors/:id/create-order", async (req, res) => {
     }
 
     // Fetch doctor
-    const doctor = await Doctor.findById(doctorId)
+    const doctor = await Doctor.findOne({ _id: doctorId, hospitalId: HOSPITAL_ID })
     if (!doctor) {
       return res.status(404).json({
         success: false,
@@ -102,8 +337,6 @@ app.post("/api/doctors/:id/create-order", async (req, res) => {
     })
 
     if (paymentResult.success && paymentResult.requiresAction) {
-      // Store temporary booking data (you might want to use Redis for this in production)
-      // For now, we'll return the order details to frontend
       return res.json({
         success: true,
         message: "Razorpay order created successfully",
@@ -129,7 +362,7 @@ app.post("/api/doctors/:id/create-order", async (req, res) => {
   }
 })
 
-// 🆕 STEP 2: Verify Razorpay payment and complete booking
+// Verify Razorpay payment - PUBLIC
 app.post("/api/doctors/:id/verify-payment", async (req, res) => {
   const session = await mongoose.startSession()
 
@@ -142,7 +375,7 @@ app.post("/api/doctors/:id/verify-payment", async (req, res) => {
     const { name, age, gender, reason, location } = patientData
 
     // Fetch doctor
-    const doctor = await Doctor.findById(doctorId).session(session)
+    const doctor = await Doctor.findOne({ _id: doctorId, hospitalId: HOSPITAL_ID }).session(session)
     if (!doctor) {
       await session.abortTransaction()
       return res.status(404).json({
@@ -169,6 +402,7 @@ app.post("/api/doctors/:id/verify-payment", async (req, res) => {
         reason,
         location,
         doctorId,
+        hospitalId: HOSPITAL_ID,
         visitedAt: new Date(),
       })
 
@@ -190,6 +424,7 @@ app.post("/api/doctors/:id/verify-payment", async (req, res) => {
         paymentGatewayResponse: paymentResult.gatewayResponse,
         queuePosition,
         patientDetails: { age, gender, reason, location },
+        hospitalId: HOSPITAL_ID,
       })
 
       await transaction.save({ session })
@@ -252,66 +487,7 @@ app.post("/api/doctors/:id/verify-payment", async (req, res) => {
   }
 })
 
-// 🆕 Refund payment
-app.post("/api/transactions/:transactionId/refund", async (req, res) => {
-  try {
-    const { transactionId } = req.params
-    const { reason = "Appointment cancelled by hospital" } = req.body
-
-    // Find transaction
-    const transaction = await Transaction.findOne({ transactionId })
-    if (!transaction) {
-      return res.status(404).json({
-        success: false,
-        message: "Transaction not found",
-      })
-    }
-
-    if (transaction.paymentStatus !== "completed") {
-      return res.status(400).json({
-        success: false,
-        message: "Cannot refund incomplete payment",
-      })
-    }
-
-    // Process refund
-    const refundResult = await paymentService.refundRazorpayPayment(
-      transaction.transactionId,
-      transaction.amount,
-      reason,
-    )
-
-    if (refundResult.success) {
-      // Update transaction status
-      transaction.paymentStatus = "refunded"
-      transaction.paymentGatewayResponse = {
-        ...transaction.paymentGatewayResponse,
-        refund: refundResult.refundData,
-        refundedAt: new Date().toISOString(),
-      }
-      await transaction.save()
-
-      return res.json({
-        success: true,
-        message: "Refund processed successfully",
-        data: {
-          refundId: refundResult.refundId,
-          amount: refundResult.amount,
-          status: refundResult.status,
-        },
-      })
-    }
-  } catch (error) {
-    console.error("❌ Refund error:", error)
-    return res.status(500).json({
-      success: false,
-      message: "Refund processing failed",
-      error: error.message,
-    })
-  }
-})
-
-// Original payment route (now supports both mock and razorpay)
+// Original payment route (now supports both mock and razorpay) - PUBLIC
 app.post("/api/doctors/:id/pay", async (req, res) => {
   const session = await mongoose.startSession()
 
@@ -333,7 +509,7 @@ app.post("/api/doctors/:id/pay", async (req, res) => {
     }
 
     // Fetch doctor and validate
-    const doctor = await Doctor.findById(doctorId).session(session)
+    const doctor = await Doctor.findOne({ _id: doctorId, hospitalId: HOSPITAL_ID }).session(session)
     if (!doctor) {
       await session.abortTransaction()
       return res.status(404).json({
@@ -358,6 +534,7 @@ app.post("/api/doctors/:id/pay", async (req, res) => {
       reason,
       location,
       doctorId,
+      hospitalId: HOSPITAL_ID,
       visitedAt: new Date(),
     })
 
@@ -380,6 +557,7 @@ app.post("/api/doctors/:id/pay", async (req, res) => {
       transactionId: transactionRef,
       queuePosition,
       patientDetails: { age, gender, reason, location },
+      hospitalId: HOSPITAL_ID,
     })
 
     const savedTransaction = await transaction.save({ session })
@@ -469,13 +647,13 @@ app.post("/api/doctors/:id/pay", async (req, res) => {
   }
 })
 
-// Get payment history for a doctor
+// Get payment history for a doctor - PUBLIC
 app.get("/api/doctors/:id/transactions", async (req, res) => {
   try {
     const doctorId = req.params.id
     const { page = 1, limit = 10, status } = req.query
 
-    const query = { doctorId }
+    const query = { doctorId, hospitalId: HOSPITAL_ID }
     if (status) {
       query.paymentStatus = status
     }
@@ -509,49 +687,9 @@ app.get("/api/doctors/:id/transactions", async (req, res) => {
   }
 })
 
-// Get all transactions (admin)
-app.get("/api/admin/transactions", async (req, res) => {
-  try {
-    const { page = 1, limit = 20, status } = req.query
-
-    const query = {}
-    if (status) {
-      query.paymentStatus = status
-    }
-
-    const transactions = await Transaction.find(query)
-      .populate("doctorId", "name specialization")
-      .populate("patientId", "name age gender")
-      .sort({ createdAt: -1 })
-      .limit(limit * 1)
-      .skip((page - 1) * limit)
-      .exec()
-
-    const total = await Transaction.countDocuments(query)
-
-    res.json({
-      success: true,
-      data: {
-        transactions,
-        pagination: {
-          current: page,
-          pages: Math.ceil(total / limit),
-          total,
-        },
-      },
-    })
-  } catch (error) {
-    console.error("Error fetching all transactions:", error)
-    res.status(500).json({
-      success: false,
-      message: "Error fetching transaction history",
-    })
-  }
-})
-
-// Original join queue route (kept for backward compatibility)
+// Original join queue route (kept for backward compatibility) - PUBLIC
 app.post("/api/doctors/:id/join", async (req, res) => {
-  const doctor = await Doctor.findById(req.params.id)
+  const doctor = await Doctor.findOne({ _id: req.params.id, hospitalId: HOSPITAL_ID })
   if (!doctor) return res.status(404).json({ error: "Doctor not found" })
 
   const patient = {
@@ -569,99 +707,42 @@ app.post("/api/doctors/:id/join", async (req, res) => {
   await Patient.create({
     ...patient,
     doctorId: doctor._id,
+    hospitalId: HOSPITAL_ID,
   })
 
   res.json({ position: doctor.queue.length })
 })
 
-// Get patient status in queue
-app.get("/api/doctors/:id/status", async (req, res) => {
-  const { name } = req.query
-  const doc = await Doctor.findById(req.params.id)
-  const pos = doc.queue.findIndex((p) => p.name === name)
-  res.json({ position: pos >= 0 ? pos + 1 : null })
-})
-
-// Next patient (dequeue)
+// Next patient (dequeue) - PUBLIC
 app.post("/api/doctors/:id/next", async (req, res) => {
-  const doc = await Doctor.findById(req.params.id)
+  const doc = await Doctor.findOne({ _id: req.params.id, hospitalId: HOSPITAL_ID })
+  if (!doc) return res.status(404).json({ error: "Doctor not found" })
+
   const [next, ...rest] = doc.queue
   doc.queue = rest
   await doc.save()
   res.json({ next })
 })
 
-// Toggle active/inactive
-app.post("/api/admin/doctors/:id/toggle", async (req, res) => {
-  const doc = await Doctor.findById(req.params.id)
+// Get patient status in queue - PUBLIC
+app.get("/api/doctors/:id/status", async (req, res) => {
+  const { name } = req.query
+  const doc = await Doctor.findOne({ _id: req.params.id, hospitalId: HOSPITAL_ID })
   if (!doc) return res.status(404).json({ error: "Doctor not found" })
 
-  doc.active = !doc.active
-  await doc.save()
-  res.json({ active: doc.active })
+  const pos = doc.queue.findIndex((p) => p.name === name)
+  res.json({ position: pos >= 0 ? pos + 1 : null })
 })
-
-// Accept POST too (for compatibility with frontend)
-app.post("/api/admin/doctors/:id/fee", async (req, res) => {
-  try {
-    const { fee, currency = "INR" } = req.body
-
-    if (!fee || fee < 0) {
-      return res.status(400).json({ error: "Invalid fee amount" })
-    }
-
-    const doc = await Doctor.findByIdAndUpdate(
-      req.params.id,
-      { fee: Number(fee), currency },
-      { new: true }
-    )
-
-    if (!doc) return res.status(404).json({ error: "Doctor not found" })
-
-    res.json({ success: true, doctor: doc })
-  } catch (error) {
-    res.status(500).json({ error: error.message })
-  }
-})
-
-// Update doctor fee
-app.put("/api/admin/doctors/:id/fee", async (req, res) => {
-  try {
-    const { fee, currency = "INR" } = req.body
-
-    if (!fee || fee < 0) {
-      return res.status(400).json({ error: "Invalid fee amount" })
-    }
-
-    const doc = await Doctor.findByIdAndUpdate(req.params.id, { fee: Number(fee), currency }, { new: true })
-
-    if (!doc) return res.status(404).json({ error: "Doctor not found" })
-
-    res.json({ success: true, doctor: doc })
-  } catch (error) {
-    res.status(500).json({ error: error.message })
-  }
-})
-
-app.get("/api/admin/patients/:doctorId", async (req, res) => {
-  const patients = await Patient.find({ doctorId: req.params.doctorId })
-  res.json({ patients })
-})
-
-app.get("/api/admin/patients", async (req, res) => {
-  const patients = await Patient.find().populate("doctorId")
-  res.json({ patients })
-})
-app.get("/", (req, res) => {
-  res.redirect("/admin");
-});
-
 
 // Connect to MongoDB and start server
 mongoose
   .connect(process.env.MONGO_URI)
   .then(() => {
     console.log("✅ MongoDB connected")
-    app.listen(process.env.PORT || 3001, () => console.log("🚀 Hospital server running at http://localhost:3001/admin"))
+    console.log(`🏥 Hospital: ${HOSPITAL_NAME} (ID: ${HOSPITAL_ID})`)
+    app.listen(process.env.PORT || 3001, () => {
+      console.log(`🚀 Hospital server running at http://localhost:${process.env.PORT || 3001}/admin`)
+      console.log(`🔐 Authentication: ${process.env.CENTRAL_AUTH_URL || "Mock mode"}`)
+    })
   })
   .catch((err) => console.error("❌ MongoDB failed:", err))

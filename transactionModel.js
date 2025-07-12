@@ -24,7 +24,6 @@ const transactionSchema = new mongoose.Schema(
     },
     currency: {
       type: String,
-      enum: ["INR", "USD"],
       default: "INR",
     },
     paymentStatus: {
@@ -34,26 +33,32 @@ const transactionSchema = new mongoose.Schema(
     },
     paymentMethod: {
       type: String,
-      enum: ["mock", "stripe", "razorpay", "cash"],
-      default: "mock",
+      enum: ["razorpay", "mock", "cash"],
+      default: "razorpay",
     },
     transactionId: {
       type: String,
+      required: true,
       unique: true,
-      sparse: true,
     },
     paymentGatewayResponse: {
       type: mongoose.Schema.Types.Mixed,
+      default: {},
     },
     queuePosition: {
       type: Number,
-      required: true,
+      min: 1,
     },
     patientDetails: {
       age: Number,
       gender: String,
       reason: String,
       location: String,
+    },
+    hospitalId: {
+      type: String,
+      required: true,
+      index: true,
     },
   },
   {
@@ -62,8 +67,9 @@ const transactionSchema = new mongoose.Schema(
 )
 
 // Indexes for efficient queries
-transactionSchema.index({ doctorId: 1, createdAt: -1 })
-transactionSchema.index({ patientId: 1 })
+transactionSchema.index({ hospitalId: 1, paymentStatus: 1 })
+transactionSchema.index({ hospitalId: 1, doctorId: 1 })
+transactionSchema.index({ hospitalId: 1, createdAt: -1 })
 transactionSchema.index({ transactionId: 1 })
 
 module.exports = mongoose.model("Transaction", transactionSchema)
